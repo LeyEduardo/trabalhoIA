@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Boleiro | Chat do Brasileirão</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚽</text></svg>">
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <main class="app-shell" id="app-shell">
+    <!-- Gerenciador de historico: lista de conversas salvas no localStorage -->
+    <aside class="sidebar" id="sidebar" aria-label="Histórico de conversas">
+      <div class="sidebar-top">
+        <button class="new-chat-button" id="new-chat" type="button">＋ Nova conversa</button>
+        <label class="sr-only" for="search">Buscar conversas</label>
+        <input class="search-input" id="search" type="search" placeholder="Buscar nas conversas..." autocomplete="off">
+      </div>
+      <nav class="history" id="history"></nav>
+      <div class="sidebar-footer">
+        <p class="history-count" id="history-count"></p>
+        <div class="footer-actions">
+          <button type="button" id="export-button" title="Baixar todas as conversas em um arquivo JSON">Exportar</button>
+          <button type="button" id="import-button" title="Carregar conversas de um arquivo JSON">Importar</button>
+          <button type="button" id="clear-button" class="danger" title="Apagar todas as conversas">Apagar tudo</button>
+        </div>
+        <input type="file" id="import-file" accept="application/json,.json" hidden>
+      </div>
+    </aside>
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <section class="chat-panel" aria-label="Chat com o Boleiro">
+      <header class="chat-header">
+        <button class="menu-button" id="menu-button" type="button" aria-label="Abrir histórico de conversas" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <div class="avatar" aria-hidden="true">🤖</div>
+        <div class="identity"><h1>Boleiro</h1><p id="chat-subtitle">Nova conversa</p></div>
+        <div class="online"><span></span> Online</div>
+      </header>
+
+      <div class="messages" id="messages" aria-live="polite"></div>
+
+      <form class="composer" id="composer">
+        <label class="sr-only" for="message-input">Digite sua pergunta</label>
+        <textarea id="message-input" name="message" rows="1" maxlength="4000" placeholder="Digite sua mensagem..." required></textarea>
+        <button class="send-button" type="submit" aria-label="Enviar mensagem" title="Enviar mensagem">➤</button>
+      </form>
+      <p class="disclaimer">Agente especializado no Campeonato Brasileiro Série A. As conversas ficam salvas só neste navegador.</p>
+    </section>
+  </main>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    // ====================================================================
+    // Armazenamento: todas as conversas ficam no localStorage do navegador
+    // Formato: [{ id, title, createdAt, updatedAt, messages: [{ role, text, time, error? }] }]
+    // ====================================================================
+    const STORAGE_KEY = "boleiro.conversas";
+    const ACTIVE_KEY = "boleiro.conversaAtiva";
+    const WELCOME = "Olá! Sou o Boleiro, seu agente sobre o Campeonato Brasileiro Série A. Pergunte sobre clubes, tabela, rodadas ou a história do campeonato.";
+    const SUGGESTIONS = [
+      "Como está a tabela do Brasileirão agora?",
+      "Quem é o artilheiro do campeonato?",
+      "Qual foi o último jogo do meu time?",
+      "Quem foi o campeão brasileiro de 2025?",
+    ];
+    const HISTORY_LIMIT = 12;
+
+    const store = {
+      load() {
+        try {
+          const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+          return Array.isArray(data) ? data.filter(isValidConversation) : [];
+        } catch {
+          return [];
+        }
+      },
+      save(list) {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+          return true;
+        } catch {
+          showToast("Não foi possível salvar: o armazenamento do navegador está cheio ou bloqueado.");
+          return false;
+        }
+      },
+      getActive() {
+        try { return localStorage.getItem(ACTIVE_KEY); } catch { return null; }
+      },
+      setActive(id) {
+        try { id ? localStorage.setItem(ACTIVE_KEY, id) : localStorage.removeItem(ACTIVE_KEY); } catch {}
+      },
+    };
+
+    function isValidConversation(c) {
+      return c && typeof c.id === "string" && Array.isArray(c.messages);
+    }
+
+    let conversations = store.load();
+    let activeId = conversations.some((c) => c.id === store.getActive()) ? store.getActive() : null;
+    let pendingId = null; // conversa aguardando resposta do servidor
+
+    const $ = (id) => document.getElementById(id);
+    const messagesEl = $("messages");
+    const historyEl = $("history");
+    const form = $("composer");
+    const input = $("message-input");
+    const sendButton = form.querySelector(".send-button");
+    const searchInput = $("search");
+
+    const newId = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+    const hhmm = () => new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+    const findConversation = (id) => conversations.find((c) => c.id === id);
+    const makeTitle = (text) => {
+      const clean = text.replace(/\s+/g, " ").trim();
+      return clean.length > 42 ? clean.slice(0, 42).trimEnd() + "…" : clean;
+    };
+
+    function persist() {
+      store.save(conversations);
+      store.setActive(activeId);
+    }
+
+    // ====================================================================
+    // Renderizacao das mensagens
+    // ====================================================================
+
+    // Markdown basico e seguro: escapa o HTML e so depois aplica listas, negrito e links
+    function renderText(text) {
+      const escaped = text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      return escaped
+        .replace(/^[ \t]*[*-][ \t]+/gm, "• ")
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+    }
+
+    function messageElement(role, text, time, isError = false) {
+      const row = document.createElement("div");
+      row.className = `message-row ${role === "user" ? "user-row" : "bot-row"}`;
+      if (role !== "user") {
+        const avatar = document.createElement("div");
+        avatar.className = "avatar small-avatar";
+        avatar.setAttribute("aria-hidden", "true");
+        avatar.textContent = "🤖";
+        row.appendChild(avatar);
+      }
+      const bubble = document.createElement("div");
+      bubble.className = `message ${role === "user" ? "user-message" : "bot-message"}${isError ? " error-message" : ""}`;
+      if (text === null) {
+        bubble.classList.add("typing");
+        bubble.innerHTML = "<span></span><span></span><span></span>";
+      } else {
+        const p = document.createElement("p");
+        if (role === "user") p.textContent = text; else p.innerHTML = renderText(text);
+        const t = document.createElement("time");
+        t.textContent = time || hhmm();
+        if (role === "user") t.insertAdjacentHTML("beforeend", " <b>✓✓</b>");
+        bubble.append(p, t);
+      }
+      row.appendChild(bubble);
+      return row;
+    }
+
+    function renderMessages() {
+      const conversation = findConversation(activeId);
+      messagesEl.replaceChildren(messageElement("model", WELCOME, conversation ? conversation.messages[0]?.time : hhmm()));
+
+      if (!conversation) {
+        const box = document.createElement("div");
+        box.className = "suggestions";
+        SUGGESTIONS.forEach((question) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.textContent = question;
+          chip.addEventListener("click", () => sendMessage(question));
+          box.appendChild(chip);
+        });
+        messagesEl.appendChild(box);
+      } else {
+        conversation.messages.forEach((m) => messagesEl.appendChild(messageElement(m.role, m.text, m.time, m.error)));
+        if (pendingId === conversation.id) messagesEl.appendChild(messageElement("model", null));
+      }
+      // So a ultima mensagem anima; as demais ja estavam na tela
+      messagesEl.querySelectorAll(".message-row:not(:last-child)").forEach((row) => { row.style.animation = "none"; });
+      $("chat-subtitle").textContent = conversation ? conversation.title : "Nova conversa";
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    // ====================================================================
+    // Lista de conversas (barra lateral)
+    // ====================================================================
+    function groupLabel(timestamp) {
+      const day = new Date(timestamp); day.setHours(0, 0, 0, 0);
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const diff = Math.round((today - day) / 86400000);
+      if (diff <= 0) return "Hoje";
+      if (diff === 1) return "Ontem";
+      if (diff < 7) return "Últimos 7 dias";
+      if (diff < 30) return "Últimos 30 dias";
+      return "Mais antigas";
+    }
+
+    function renderHistory() {
+      const term = searchInput.value.trim().toLowerCase();
+      const list = [...conversations]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .filter((c) => !term || c.title.toLowerCase().includes(term) || c.messages.some((m) => m.text.toLowerCase().includes(term)));
+
+      historyEl.replaceChildren();
+      if (!list.length) {
+        const empty = document.createElement("p");
+        empty.className = "history-empty";
+        empty.textContent = term ? "Nenhuma conversa encontrada." : "Suas conversas aparecem aqui.";
+        historyEl.appendChild(empty);
+      }
+
+      let currentGroup = null;
+      list.forEach((conversation) => {
+        const label = groupLabel(conversation.updatedAt);
+        if (label !== currentGroup) {
+          currentGroup = label;
+          const heading = document.createElement("h2");
+          heading.className = "history-group";
+          heading.textContent = label;
+          historyEl.appendChild(heading);
+        }
+        historyEl.appendChild(historyItem(conversation));
+      });
+
+      const total = conversations.length;
+      $("history-count").textContent = total === 1 ? "1 conversa salva" : `${total} conversas salvas`;
+      $("export-button").disabled = $("clear-button").disabled = total === 0;
+    }
+
+    function historyItem(conversation) {
+      const item = document.createElement("div");
+      item.className = "history-item" + (conversation.id === activeId ? " active" : "");
+
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "history-open";
+      open.title = conversation.title;
+      const title = document.createElement("span");
+      title.className = "history-title";
+      title.textContent = (pendingId === conversation.id ? "⏳ " : "") + conversation.title;
+      const meta = document.createElement("span");
+      meta.className = "history-meta";
+      const count = conversation.messages.length;
+      meta.textContent = `${new Date(conversation.updatedAt).toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })} · ${count} ${count === 1 ? "mensagem" : "mensagens"}`;
+      open.append(title, meta);
+      open.addEventListener("click", () => openConversation(conversation.id));
+
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "icon-button";
+      rename.textContent = "✎";
+      rename.title = "Renomear";
+      rename.setAttribute("aria-label", `Renomear "${conversation.title}"`);
+      rename.addEventListener("click", () => startRename(item, conversation));
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "icon-button danger";
+      remove.textContent = "🗑";
+      remove.title = "Excluir";
+      remove.setAttribute("aria-label", `Excluir "${conversation.title}"`);
+      remove.addEventListener("click", () => deleteConversation(conversation.id));
+
+      item.append(open, rename, remove);
+      return item;
+    }
+
+    function startRename(item, conversation) {
+      const field = document.createElement("input");
+      field.className = "rename-input";
+      field.value = conversation.title;
+      field.maxLength = 80;
+      field.setAttribute("aria-label", "Novo nome da conversa");
+      item.replaceChildren(field);
+      field.focus();
+      field.select();
+
+      let done = false;
+      const finish = (save) => {
+        if (done) return;
+        done = true;
+        const value = field.value.trim();
+        if (save && value) {
+          conversation.title = value;
+          persist();
+        }
+        renderHistory();
+        renderMessages();
+      };
+      field.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") finish(true);
+        if (e.key === "Escape") finish(false);
+      });
+      field.addEventListener("blur", () => finish(true));
+    }
+
+    // ====================================================================
+    // Acoes do gerenciador
+    // ====================================================================
+    function openConversation(id) {
+      activeId = id;
+      store.setActive(id);
+      renderHistory();
+      renderMessages();
+      closeSidebar();
+      input.focus();
+    }
+
+    function newConversation() {
+      // A conversa so e criada de verdade quando a primeira mensagem e enviada
+      activeId = null;
+      store.setActive(null);
+      searchInput.value = "";
+      renderHistory();
+      renderMessages();
+      closeSidebar();
+      input.focus();
+    }
+
+    function deleteConversation(id) {
+      const conversation = findConversation(id);
+      if (!conversation || !confirm(`Excluir a conversa "${conversation.title}"? Isso não pode ser desfeito.`)) return;
+      conversations = conversations.filter((c) => c.id !== id);
+      if (activeId === id) activeId = null;
+      persist();
+      renderHistory();
+      renderMessages();
+      showToast("Conversa excluída.");
+    }
+
+    function clearAll() {
+      if (!conversations.length || !confirm(`Apagar todas as ${conversations.length} conversas? Isso não pode ser desfeito.`)) return;
+      conversations = [];
+      activeId = null;
+      persist();
+      renderHistory();
+      renderMessages();
+      showToast("Todas as conversas foram apagadas.");
+    }
+
+    function exportConversations() {
+      const blob = new Blob([JSON.stringify({ app: "boleiro", exportedAt: new Date().toISOString(), conversations }, null, 2)], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `boleiro-conversas-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    }
+
+    async function importConversations(file) {
+      try {
+        const data = JSON.parse(await file.text());
+        const incoming = (Array.isArray(data) ? data : data.conversations || [])
+          .filter(isValidConversation)
+          .map((c) => ({
+            id: c.id,
+            title: String(c.title || "Conversa importada").slice(0, 80),
+            createdAt: Number(c.createdAt) || Date.now(),
+            updatedAt: Number(c.updatedAt) || Date.now(),
+            messages: c.messages
+              .filter((m) => m && (m.role === "user" || m.role === "model") && typeof m.text === "string")
+              .map((m) => ({ role: m.role, text: m.text, time: String(m.time || ""), ...(m.error ? { error: true } : {}) })),
+          }));
+        const known = new Set(conversations.map((c) => c.id));
+        const added = incoming.filter((c) => !known.has(c.id));
+        if (!added.length) return showToast("Nenhuma conversa nova encontrada no arquivo.");
+        conversations = [...conversations, ...added];
+        persist();
+        renderHistory();
+        showToast(`${added.length} ${added.length === 1 ? "conversa importada" : "conversas importadas"}.`);
+      } catch {
+        showToast("Arquivo inválido: escolha um JSON exportado pelo Boleiro.");
+      }
+    }
+
+    // ====================================================================
+    // Envio de mensagens
+    // ====================================================================
+    async function sendMessage(text) {
+      const message = text.trim();
+      if (!message || pendingId) return;
+
+      let conversation = findConversation(activeId);
+      if (!conversation) {
+        conversation = { id: newId(), title: makeTitle(message), createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
+        conversations.push(conversation);
+        activeId = conversation.id;
+      }
+
+      // Historico enviado ao modelo: ultimas mensagens validas (sem avisos de erro)
+      const history = conversation.messages.filter((m) => !m.error).slice(-HISTORY_LIMIT).map(({ role, text }) => ({ role, text }));
+
+      conversation.messages.push({ role: "user", text: message, time: hhmm() });
+      conversation.updatedAt = Date.now();
+      pendingId = conversation.id;
+      persist();
+      input.value = "";
+      autoResize();
+      setBusy(true);
+      renderHistory();
+      renderMessages();
+
+      let reply;
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message, history }),
+        });
+        const data = await response.json().catch(() => ({}));
+        reply = response.ok
+          ? { role: "model", text: data.answer, time: data.time || hhmm() }
+          : { role: "model", text: data.error || "Não consegui responder agora.", time: hhmm(), error: true };
+      } catch {
+        reply = { role: "model", text: "Sem conexão com o servidor. Verifique se o app.py está rodando.", time: hhmm(), error: true };
+      }
+
+      // A resposta volta para a conversa de origem, mesmo que o usuario tenha trocado de conversa.
+      // Se ela foi excluida enquanto esperava, a resposta e descartada.
+      const target = findConversation(conversation.id);
+      if (target) {
+        target.messages.push(reply);
+        target.updatedAt = Date.now();
+      }
+      pendingId = null;
+      persist();
+      setBusy(false);
+      renderHistory();
+      renderMessages();
+    }
+
+    function setBusy(busy) {
+      input.disabled = busy;
+      sendButton.disabled = busy;
+      if (!busy) input.focus();
+    }
+
+    function autoResize() {
+      input.style.height = "auto";
+      input.style.height = Math.min(input.scrollHeight, 140) + "px";
+    }
+
+    // ====================================================================
+    // Barra lateral no celular, avisos e eventos
+    // ====================================================================
+    function openSidebar() {
+      $("app-shell").classList.add("sidebar-open");
+      $("menu-button").setAttribute("aria-expanded", "true");
+    }
+    function closeSidebar() {
+      $("app-shell").classList.remove("sidebar-open");
+      $("menu-button").setAttribute("aria-expanded", "false");
+    }
+
+    let toastTimer;
+    function showToast(text) {
+      const toast = $("toast");
+      toast.textContent = text;
+      toast.classList.add("visible");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove("visible"), 3200);
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      sendMessage(input.value);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+    input.addEventListener("input", autoResize);
+    searchInput.addEventListener("input", renderHistory);
+    $("new-chat").addEventListener("click", newConversation);
+    $("clear-button").addEventListener("click", clearAll);
+    $("export-button").addEventListener("click", exportConversations);
+    $("import-button").addEventListener("click", () => $("import-file").click());
+    $("import-file").addEventListener("change", (event) => {
+      if (event.target.files[0]) importConversations(event.target.files[0]);
+      event.target.value = "";
+    });
+    $("menu-button").addEventListener("click", openSidebar);
+    $("sidebar-backdrop").addEventListener("click", closeSidebar);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeSidebar();
+    });
+
+    // Mantem as abas sincronizadas: uma conversa criada em outra aba aparece aqui tambem
+    window.addEventListener("storage", (event) => {
+      if (event.key !== STORAGE_KEY || pendingId) return;
+      conversations = store.load();
+      if (activeId && !findConversation(activeId)) activeId = null;
+      renderHistory();
+      renderMessages();
+    });
+
+    renderHistory();
+    renderMessages();
+    input.focus();
+  </script>
+</body>
+</html>
