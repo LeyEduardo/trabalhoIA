@@ -21,7 +21,6 @@ FALLBACK_MODELS = [
     if name.strip() and name.strip() != MODEL_NAME
 ]
 # Como o agente acessa a internet:
-#   duckduckgo -> funcoes proprias (web_tools.py); funciona no plano gratuito
 #   google     -> Pesquisa Google integrada do Gemini; exige plano com cota para "grounding"
 #   off        -> sem internet
 WEB_SEARCH = os.getenv("GEMINI_WEB_SEARCH", "duckduckgo").strip().lower()
